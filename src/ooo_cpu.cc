@@ -370,11 +370,11 @@ void O3_CPU::do_scheduling(ooo_model_instr& instr)
         instr.num_reg_dependent++;
       }
 
-      if constexpr (champsim::sf_debug_print) {
+      if constexpr (champsim::debug_print) {
         fmt::print("[DISPATCH] {} instr_id: {} depends on: {} load: {}\n", __func__, instr.instr_id, prior.instr_id, prior.is_load);
       }
 
-      if constexpr (champsim::sf_debug_print) {
+      if constexpr (champsim::debug_print) {
         fmt::print("[DISPATCH] {} instr_id: {} src_reg: {} dst_reg: {}\n", __func__, instr.instr_id, src_reg, instr.destination_registers);
       }
     }
@@ -500,7 +500,7 @@ long O3_CPU::operate_lsq()
         lq_entry->fetch_issued = true;
         lq_entry->fetch_issued_cycle = current_cycle;
 
-        if constexpr (champsim::sf_debug_print) {
+        if constexpr (champsim::debug_print) {
           fmt::print("[LQ] {} instr_id: {} vaddr: {:#x} fetch issued at cycle: {}\n", __func__, lq_entry->instr_id, lq_entry->virtual_address, current_cycle);
         }
       }
@@ -509,6 +509,8 @@ long O3_CPU::operate_lsq()
     if (!lq_entry->finished && lq_entry->fetch_issued && (current_cycle > lq_entry->fetch_issued_cycle + LD_LATENCY)) {
       if (unique_loads.find(lq_entry->instr_id) == unique_loads.end()) {
         unique_loads.insert(lq_entry->instr_id);
+        lq_entry->instr_id.is_missed = 1;
+
         sim_stats.detected_load_misses++;
 
         if constexpr (champsim::sf_debug_print) {
@@ -517,19 +519,17 @@ long O3_CPU::operate_lsq()
         }
 
         // [WIP] Reschedule the instructions after this load if the instruction is not issued but is scheduled
-        if (enable_scheduling_flush) {
-          for (auto& instr : ROB) {
-            if (instr.instr_id > lq_entry->instr_id && instr.scheduled == COMPLETED && instr.executed != COMPLETED
-                && instr.event_cycle > lq_entry->fetch_issued_cycle) {
-              auto prev_event_cycle = instr.event_cycle;
-              instr.event_cycle = std::max(instr.event_cycle, current_cycle + LD_LATENCY);
+        // for (auto& instr : ROB) {
+        //   if (instr.instr_id > lq_entry->instr_id && instr.scheduled == COMPLETED && instr.executed != COMPLETED && instr.event_cycle >
+        //   lq_entry->fetch_issued_cycle) {
+        //     auto prev_event_cycle = instr.event_cycle;
+        //     instr.event_cycle = std::max(instr.event_cycle, current_cycle + LD_LATENCY);
 
-              if constexpr (champsim::sf_debug_print) {
-                fmt::print("[SF] {} instr_id: {} prev_event_cycle: {} new_event_cycle: {}\n", __func__, instr.instr_id, prev_event_cycle, instr.event_cycle);
-              }
-            }
-          }
-        }
+        //     if constexpr (champsim::sf_debug_print) {
+        //       fmt::print("[SF] {} instr_id: {} prev_event_cycle: {} new_event_cycle: {}\n", __func__, instr.instr_id, prev_event_cycle, instr.event_cycle);
+        //     }
+        //   }
+        // }
       }
     }
   }
@@ -650,16 +650,30 @@ long O3_CPU::handle_memory_return()
   for (auto l1d_bw = L1D_BANDWIDTH; l1d_bw > 0 && l1d_it != std::end(L1D_bus.lower_level->returned); --l1d_bw, ++l1d_it) {
     for (auto& lq_entry : LQ) {
       if (lq_entry.has_value() && lq_entry->fetch_issued && lq_entry->virtual_address >> LOG2_BLOCK_SIZE == l1d_it->v_address >> LOG2_BLOCK_SIZE) {
-        lq_entry->finish(std::begin(ROB), std::end(ROB));
-        lq_entry->finished = true;
-        lq_entry.reset();
-        ++progress;
-
-        if constexpr (champsim::sf_debug_print) {
-          fmt::print("[LQ] {} instr_id: {} vaddr: {:#x} finished at cycle: {}\n", __func__, lq_entry->instr_id, lq_entry->virtual_address, current_cycle);
+        if (lq_entry->instr_id.is_missed) {
+          for (auto& instr : ROB) {
+            if (instr.instr_id > lq_entry->instr_id && instr.event_cycle > lq_entry->fetch_issued_cycle) {
+              //  auto prev_event_cycle = instr.event_cycle;
+              instr.event_cycle = current_cycle + SCHEDULING_LATENCY + EXEC_LATENCY;
+            }
+          }
+          if constexpr (champsim::sf_debug_print) {
+            fmt::print("[SF] {} instr_id: {} event_cycle: {} current cycle: {} \n", __func__, instr.instr_id, instr.event_cycle, current_cycle);
+          }
+          lq_entry->finish(std::begin(ROB), std::end(ROB));
+          lq_entry->finished = true;
+          lq_entry.reset();
+          ++progress;
+        } else {
+          lq_entry->finish(std::begin(ROB), std::end(ROB));
+          lq_entry->finished = true;
+          lq_entry.reset();
+          ++progress;
+          if constexpr (champsim::sf_debug_print) {
+            fmt::print("[SF] {} instr_id: {} event_cycle: {} current cycle: {} \n", __func__, instr.instr_id, instr.event_cycle, current_cycle);
+          }
         }
       }
-
     }
     ++progress;
   }
@@ -671,8 +685,9 @@ long O3_CPU::handle_memory_return()
 long O3_CPU::retire_rob()
 {
   auto [retire_begin, retire_end] = champsim::get_span_p(std::cbegin(ROB), std::cend(ROB), RETIRE_WIDTH, [](const auto& x) { return x.executed == COMPLETED; });
-  if constexpr (champsim::debug_print) {
-    std::for_each(retire_begin, retire_end, [cycle = current_cycle](const auto& x) { fmt::print("[ROB] retire_rob instr_id: {} is retired cycle: {}\n", x.instr_id, cycle); });
+  if constexpr (champsim::sf_debug_print) {
+    std::for_each(retire_begin, retire_end,
+                  [cycle = current_cycle](const auto& x) { fmt::print("[ROB] retire_rob instr_id: {} is retired cycle: {}\n", x.instr_id, cycle); });
   }
   auto retire_count = std::distance(retire_begin, retire_end);
   num_retired += retire_count;
